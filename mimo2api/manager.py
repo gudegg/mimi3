@@ -90,6 +90,42 @@ def _aistudio_headers() -> dict:
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
 
+
+def _truncate_text(value, limit: int = 300) -> str:
+    text = str(value).replace("\n", "\\n")
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "..."
+
+
+def _response_details(resp: httpx.Response) -> tuple[dict | None, str]:
+    try:
+        data = resp.json()
+    except Exception:
+        data = None
+
+    parts = [f"HTTP {resp.status_code}"]
+    if isinstance(data, dict):
+        code = data.get("code")
+        msg = data.get("message") or data.get("msg") or data.get("error") or data.get("reason")
+        payload = data.get("data")
+        status = payload.get("status") if isinstance(payload, dict) else None
+        if code is not None:
+            parts.append(f"code={code}")
+        if msg:
+            parts.append(f"message={_truncate_text(msg)}")
+        if status:
+            parts.append(f"status={status}")
+        if isinstance(payload, dict):
+            for key in ("reason", "error", "desc", "detail"):
+                if payload.get(key):
+                    parts.append(f"{key}={_truncate_text(payload[key])}")
+                    break
+    else:
+        raw_text = _truncate_text(resp.text) if getattr(resp, "text", None) else "<empty>"
+        parts.append(f"body={raw_text}")
+    return data, ", ".join(parts)
+
 # ----------------- Native Claw Client实现 -----------------
 
 class NativeClawClient:
@@ -112,14 +148,17 @@ class NativeClawClient:
         try:
             async with httpx.AsyncClient() as client:
                 r = await client.post(url, cookies=c_copy, headers=_aistudio_headers(), timeout=30)
-                data = r.json()
-                if data.get("code") == 0:
-                    self.logger.info(f"销毁请求发送成功: {data.get('data', {}).get('status')}")
+                data, detail = _response_details(r)
+                if isinstance(data, dict) and data.get("code") == 0:
+                    self.logger.info(f"销毁请求发送成功: {detail}")
+                else:
+                    self.logger.warning(f"销毁请求返回异常: {detail}")
                 # 无论如何等三秒后看看状态
                 await asyncio.sleep(3)
                 status_url = f"{BASE_URL}/open-apis/user/mimo-claw/status"
                 sr = await client.get(status_url, cookies=c_copy, headers=_aistudio_headers(), timeout=30)
-                self.logger.info(f"销毁后终态结果: {sr.json().get('data', {}).get('status')}")
+                _, status_detail = _response_details(sr)
+                self.logger.info(f"销毁后终态结果: {status_detail}")
                 return True
         except Exception as e:
             self.logger.error(f"销毁 Claw 异常: {e}")
@@ -134,37 +173,59 @@ class NativeClawClient:
         async with httpx.AsyncClient() as client:
             # 1. 尝试签署 agreement
             try:
-                await client.post(url_agree, cookies=self.cookies, headers=_aistudio_headers(), timeout=15)
-            except Exception:
-                pass
+                agree_resp = await client.post(url_agree, cookies=self.cookies, headers=_aistudio_headers(), timeout=15)
+                agree_data, agree_detail = _response_details(agree_resp)
+                if agree_resp.status_code >= 400 or (isinstance(agree_data, dict) and agree_data.get("code") not in (None, 0)):
+                    self.logger.warning(f"签署 agreement 返回异常: {agree_detail}")
+            except Exception as e:
+                self.logger.warning(f"签署 agreement 异常: {e}")
                 
             # 2. 发起创建
             r = await client.post(url_create, cookies=self.cookies, headers=_aistudio_headers(), timeout=20)
+            create_data, create_detail = _response_details(r)
             if r.status_code == 401:
-                self.logger.error("账户已过期失效 (Create 401)")
+                self.logger.error(f"账户已过期失效: {create_detail}")
+                return False
+            if r.status_code == 429:
+                self.logger.error(f"当前 Claw 实例负载过高: {create_detail}")
+                return False
+            if r.status_code >= 400:
+                self.logger.error(f"创建实例请求失败: {create_detail}")
+                return False
+            if isinstance(create_data, dict) and create_data.get("code") not in (None, 0):
+                self.logger.error(f"创建实例接口返回异常: {create_detail}")
                 return False
             
             # 3. 轮询直到 AVAILABLE
             deadline = time.time() + 120
             last_status = None
+            last_status_detail = "未拿到状态详情"
             while time.time() < deadline:
                 sr = await client.get(url_status, cookies=self.cookies, headers=_aistudio_headers(), timeout=15)
                 if sr.status_code == 401:
+                    _, status_detail = _response_details(sr)
+                    self.logger.error(f"查询创建状态遭遇鉴权失败: {status_detail}")
                     return False
                 try:
-                    d = sr.json()
+                    d, status_detail = _response_details(sr)
+                    last_status_detail = status_detail
+                    if not isinstance(d, dict):
+                        self.logger.warning(f"状态接口返回不可解析: {status_detail}")
+                        await asyncio.sleep(2)
+                        continue
                     st = (d.get("data") or {}).get("status", "").strip()
                     if st and st != last_status:
-                        self.logger.info(f"Claw 创建状态: {st}")
+                        self.logger.info(f"Claw 创建状态: {status_detail}")
                         last_status = st
                     if st == "AVAILABLE":
                         return True
-                    if st in ("FAILED", "DESTROYED", "ERROR"):
-                        self.logger.error(f"创建失败，状态进入: {st}")
+                    if st.endswith("FAILED") or st in ("DESTROYED", "ERROR"):
+                        self.logger.error(f"创建失败，状态进入终态: {status_detail}")
                         return False
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.logger.warning(f"解析创建状态异常: {e}")
                 await asyncio.sleep(2)
+        self.logger.error(f"创建实例等待超时，最后状态: {last_status_detail}")
         return False
 
     async def _get_ticket(self) -> str:
@@ -173,15 +234,16 @@ class NativeClawClient:
         async with httpx.AsyncClient() as client:
             for attempt in range(5):
                 r = await client.get(url, cookies=self.cookies, headers=_aistudio_headers(), timeout=15)
-                if r.status_code == 200:
-                    ticket = r.json().get("data", {}).get("ticket")
+                data, detail = _response_details(r)
+                if r.status_code == 200 and isinstance(data, dict):
+                    ticket = data.get("data", {}).get("ticket")
                     if ticket:
                         return ticket
                 # 刚创建好时可能由于节点同步延迟导致 ticket 返回 400，重试几次即可，不要使其抛错
                 if attempt < 4:
-                    self.logger.warning(f"获取 Ticket 失败(HTTP {r.status_code})，3秒后重试...")
+                    self.logger.warning(f"获取 Ticket 失败: {detail}，3秒后重试...")
                     await asyncio.sleep(3)
-            raise Exception(f"HTTP {r.status_code}")
+            raise Exception(detail)
 
     async def connect(self, wait_available=True) -> bool:
         """建立 WebSocket 连接"""
@@ -310,7 +372,7 @@ class AccountManager:
             "xiaomichatbot_ph": self.ph
         }
         self.name = user_info.get("name", self.uid)
-        self.logger = logging.getLogger(f"Acc-{self.name}")
+        self.logger = logging.getLogger(f"Acc-{self.name}-{self.uid}")
         self.stagger_offset = stagger_offset
         self.is_first_round = True
 
